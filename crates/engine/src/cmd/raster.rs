@@ -585,6 +585,10 @@ pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, page: Option<&s
 /// number (a JSON number); `None` when not given, or for a raster that has no pages. Any other
 /// value is refused rather than read as the first page.
 pub(crate) fn pdf_page(path: &str, p: &Value) -> Result<Option<String>, String> {
+    // A NetCDF-4/HDF5 upload's variable, by its path (`"layer": "/group/var"`).
+    if raster::nchdf::is_name(path) {
+        return Ok(p.get("layer").and_then(Value::as_str).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()));
+    }
     if !raster::is_pdf_name(path) {
         return Ok(None);
     }

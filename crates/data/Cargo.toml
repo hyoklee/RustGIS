@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 hayro = { workspace = true, optional = true }
+hdf5-reader = { workspace = true }
 rustgis-geom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

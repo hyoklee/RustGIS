@@ -17,6 +17,7 @@ mod esri;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
 pub mod geotiff;
+pub mod nchdf;
 mod image_grid;
 mod lerc;
 mod lzw;
@@ -103,7 +104,7 @@ pub const READ_EXTENSIONS: &[&str] = &["tif", "tiff", "asc", "png", "jpg", "jpeg
 /// [`PDF_ELSEWHERE`] where [`PDF_PAGES`] is false).
 pub fn is_raster_name(name: &str) -> bool {
     let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    READ_EXTENSIONS.contains(&ext.as_str()) || ext == "pdf"
+    READ_EXTENSIONS.contains(&ext.as_str()) || ext == "pdf" || nchdf::is_name(name)
 }
 
 /// Whether a file name is a PDF's (`.pdf`): its pages are read as rasters ([`PDF_PAGES`]).
@@ -1237,6 +1238,15 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
             let text = crate::provenance::read_to_string(path)?;
             read_ascii(path, &text, &name, sidecar_nodata)?
         }
+        // NetCDF-4/HDF5 read natively in the browser, and on the desktop when GDAL isn't installed.
+        #[cfg(target_arch = "wasm32")]
+        _ if nchdf::is_name(&path.to_string_lossy()) => {
+            return nchdf::read_bytes(&path.to_string_lossy(), &std::fs::read(path)?, None);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        _ if nchdf::is_name(&path.to_string_lossy()) && !gdal::available() => {
+            return nchdf::read_bytes(&path.to_string_lossy(), &std::fs::read(path)?, None);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         _ if gdal::is_gdal_raster_name(&path.to_string_lossy()) => {
             // Converted once to a GeoTIFF in the cache; the layer still names this file.
@@ -1364,6 +1374,14 @@ fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&st
     // A PDF's page, by its number.
     if subdataset.is_some() && is_pdf_name(&path.to_string_lossy()) {
         return read_pdf_page(path, subdataset, world);
+    }
+    // A NetCDF-4/HDF5 variable, read natively where GDAL isn't (the browser, or no GDAL installed).
+    #[cfg(not(target_arch = "wasm32"))]
+    let native = !gdal::available();
+    #[cfg(target_arch = "wasm32")]
+    let native = true;
+    if native && subdataset.is_some() && nchdf::is_name(&path.to_string_lossy()) {
+        return nchdf::read_bytes(&path.to_string_lossy(), &std::fs::read(path)?, subdataset);
     }
     #[cfg(not(target_arch = "wasm32"))]
     if (subdataset.is_some() || crs.is_some()) && gdal::is_gdal_raster_name(&path.to_string_lossy()) {
@@ -1648,6 +1666,10 @@ fn from_image_unrotated(name: &str, bytes: &[u8], bbox: [f64; 4]) -> Result<Rast
 /// its coordinates when `place` (a scan otherwise): an upload or download of a PDF, and a
 /// project's copy of one reopened at the page it was added at.
 pub fn read_bytes_page(file_name: &str, bytes: &[u8], page: Option<&str>, place: bool) -> Result<Raster> {
+    // A NetCDF-4/HDF5 file's variable (`page` its path), natively.
+    if nchdf::is_name(file_name) {
+        return nchdf::read_bytes(file_name, bytes, page);
+    }
     if !is_pdf_name(file_name) {
         return read_bytes(file_name, bytes);
     }
@@ -1690,6 +1712,7 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
             let text = std::str::from_utf8(bytes).map_err(|_| DataError::Format("not a text file".into()))?;
             ascii::read(text, &name, None)
         }
+        _ if nchdf::is_name(file_name) => nchdf::read_bytes(file_name, bytes, None),
         other => Err(DataError::Unsupported(format!(".{other}"))),
     }
 }
