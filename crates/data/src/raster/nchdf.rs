@@ -417,6 +417,13 @@ mod tests {
                 continue;
             }
             let bytes = std::fs::read(&p).unwrap();
+            // Every variable the chooser lists opens by its path, as Add does.
+            if let Ok(vars) = variables(&bytes) {
+                for v in &vars {
+                    let r = crate::raster::read_bytes_page(&name, &bytes, Some(v), true);
+                    eprintln!("  {name} {v}: {}", r.map_or_else(|e| format!("ERROR {e}"), |r| format!("{}x{} {}", r.width, r.height, r.name)));
+                }
+            }
             match read_bytes(&name, &bytes, None) {
                 Ok(r) => eprintln!(
                     "{name}: {}x{}x{} {} georef={} t={:?} min={} max={} notes={:?}",
