@@ -7,6 +7,10 @@
 #
 # Options (environment):
 #   SKIP_BUILD=1       reuse dist/hdfeos from the last build
+#   BUILDER=native     build without Docker: rustup's 1.99.1 toolchain with the wasm32 target
+#                      (RUSTUP_BIN, or ~/.rustup/cargo/bin or ~/.cargo/bin),
+#                      `trunk` on PATH (or TRUNK=path) and Homebrew's LLVM clang (the default when
+#                      Docker isn't running)
 #   LOCAL_WWW=dir      local target (default /usr/local/var/www/rustgis)
 #   LOCAL_URL=url      URL checked after a local deploy (default http://localhost:8080/rustgis/)
 #   HDFEOS_HOST        ssh login for hdfeos.org (default u40291205@home161441498.1and1-data.host)
@@ -24,7 +28,10 @@ repo=$(cd "$(dirname "$0")/../.." && pwd)
 out="$repo/dist/hdfeos"
 image=rustgis-nchdf:deploy
 
-if [ "${SKIP_BUILD:-0}" != 1 ]; then
+builder=${BUILDER:-}
+[ -n "$builder" ] || { docker info >/dev/null 2>&1 && builder=docker || builder=native; }
+
+if [ "${SKIP_BUILD:-0}" != 1 ] && [ "$builder" = docker ]; then
   echo ">> building the web app in Docker (first build takes a while)"
   (cd "$repo" && DOCKER_BUILDKIT=1 docker build -t "$image" .)
   echo ">> extracting static files to $out"
@@ -33,6 +40,28 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
   trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
   docker cp "$cid:/usr/share/nginx/html/." "$out/"
   docker rm -f "$cid" >/dev/null; trap - EXIT
+elif [ "${SKIP_BUILD:-0}" != 1 ]; then
+  echo ">> building the web app natively (rustup 1.99.1 + trunk), as the Dockerfile does"
+  # rustup's proxies: RUSTUP_BIN, else a self-contained install (CARGO_HOME=~/.rustup/cargo), else ~/.cargo/bin.
+  rustup_bin=${RUSTUP_BIN:-}
+  for d in "$HOME/.rustup/cargo/bin" "$HOME/.cargo/bin"; do [ -n "$rustup_bin" ] || { [ -x "$d/rustup" ] && rustup_bin=$d; }; done
+  llvm=$(brew --prefix llvm 2>/dev/null)/bin
+  trunk=${TRUNK:-$(command -v trunk || true)}
+  [ -x "$rustup_bin/rustup" ] && [ -x "$llvm/clang" ] && [ -n "$trunk" ] \
+    || { echo "native build needs: rustup (rustup.rs) and brew install llvm; rustup toolchain install 1.99.1 --target wasm32-unknown-unknown; trunk (or TRUNK=path)" >&2; exit 1; }
+  (
+    cd "$repo"
+    export PATH="$rustup_bin:$PATH" RUSTUP_TOOLCHAIN=1.99.1
+    export CC_wasm32_unknown_unknown="$llvm/clang" AR_wasm32_unknown_unknown="$llvm/llvm-ar"
+    rm -rf dist/web
+    (cd apps/rustgis-web && "$trunk" build --release --locked --public-url ./)
+    cargo xtask web-pwa dist/web
+  )
+  echo ">> copying static files to $out"
+  rm -rf "$out"; mkdir -p "$out"
+  cp -R "$repo/dist/web/." "$out/"
+fi
+if [ "${SKIP_BUILD:-0}" != 1 ]; then
   cat > "$out/.htaccess" <<'EOF'
 AddType application/wasm .wasm
 AddType application/manifest+json .webmanifest

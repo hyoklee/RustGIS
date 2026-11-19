@@ -210,8 +210,15 @@ pub fn start() {
                         // show (unless a `#` map link placed it); `?style=<url>` adds a MapLibre style;
                         // `?tiles=<template>` a tile layer. Links that share a map. What fails is said
                         // in a notice.
-                        for url in params(links, "data", 16) {
-                            if let Err(e) = app.run("ui.addUrl", serde_json::json!({"url": url, "zoom": !linked})) {
+                        // `?layer=<name>` (one a `?data=`, in order) names what to add from it: a
+                        // NetCDF-4/HDF5 variable by path (`/HDFEOS/GRIDS/G/Data Fields/T`), a PDF's page.
+                        let layers = params(links, "layer", 16);
+                        for (i, url) in params(links, "data", 16).into_iter().enumerate() {
+                            let mut add = serde_json::json!({"url": url, "zoom": !linked});
+                            if let Some(layer) = layers.get(i) {
+                                add["layer"] = serde_json::json!(layer);
+                            }
+                            if let Err(e) = app.run("ui.addUrl", add) {
                                 app.session.notify(format!("?data={}", message_with_address(&url, &e)), true);
                             }
                         }
