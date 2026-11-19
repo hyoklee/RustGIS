@@ -204,24 +204,35 @@ pub fn read_bytes(file_name: &str, bytes: &[u8], var: Option<&str>) -> Result<Ra
     if var.is_none() && count > 1 {
         lost.push(format!("the file holds {count} variables; {} is shown (open another by its path)", pick.path));
     }
-    read_variable(&f, stem, &pick, lost)
+    read_variable(&f, bytes, stem, &pick, lost)
 }
 
-fn read_variable(f: &Hdf5File, stem: &str, v: &Found, mut lost: Vec<String>) -> Result<Raster> {
+fn read_variable(f: &Hdf5File, bytes: &[u8], stem: &str, v: &Found, mut lost: Vec<String>) -> Result<Raster> {
     let ds = &v.ds;
     let dims = ds.shape().to_vec();
     let n = dims.len();
-    let (h, w) = (dims[n - 2], dims[n - 1]);
-    let (w32, h32) = (u32::try_from(w).map_err(|_| fail(stem, "too wide"))?, u32::try_from(h).map_err(|_| fail(stem, "too tall"))?);
-    let band_count = match n {
-        3 => dims[0].min(MAX_BANDS),
-        _ => 1,
-    };
-    if n == 3 && dims[0] > MAX_BANDS {
-        lost.push(format!("{} of its {} layers along its first dimension are shown", MAX_BANDS, dims[0]));
+    // An HDF-EOS5 grid's own placement (its GCTP projection, origin and dimension order) first.
+    let eos = eos_grid(f, bytes, &v.path, &dims);
+    if let Some(Err(why)) = &eos {
+        lost.push(why.clone());
     }
-    if n == 4 && (dims[0] > 1 || dims[1] > 1) {
-        lost.push(format!("only the first step of its first two dimensions ({} × {}) is shown", dims[0], dims[1]));
+    let eos = eos.and_then(std::result::Result::ok);
+    // Its rows and columns: the grid's YDim and XDim wherever its DimList puts them (MOPITT
+    // stores (XDim, YDim, Prs)), else its last two dimensions. The first other one is its bands;
+    // any further one is taken at its first step.
+    let (iy, ix) = eos.as_ref().map_or((n - 2, n - 1), |g| (g.iy, g.ix));
+    let (h, w) = (dims[iy], dims[ix]);
+    let others: Vec<usize> = (0..n).filter(|k| *k != iy && *k != ix).collect();
+    let band_axis = others.first().copied();
+    // Read in stored order, (XDim, YDim) when XDim comes first: turned to rows of columns.
+    let transpose = ix < iy;
+    let (w32, h32) = (u32::try_from(w).map_err(|_| fail(stem, "too wide"))?, u32::try_from(h).map_err(|_| fail(stem, "too tall"))?);
+    let band_count = band_axis.map_or(1, |a| dims[a].clamp(1, MAX_BANDS));
+    if let Some(a) = band_axis.filter(|a| dims[*a] > MAX_BANDS) {
+        lost.push(format!("{} of its {} layers along its dimension {} are shown", MAX_BANDS, dims[a], a + 1));
+    }
+    if others.iter().skip(1).any(|k| dims[*k] > 1) {
+        lost.push("only the first step of its further dimensions is shown".to_string());
     }
     let per_band = (w as usize).saturating_mul(h as usize);
     if per_band.saturating_mul(band_count as usize) > max_samples() {
@@ -231,25 +242,25 @@ fn read_variable(f: &Hdf5File, stem: &str, v: &Found, mut lost: Vec<String>) -> 
     let scale = attr_f64(ds, "scale_factor");
     let offset = attr_f64(ds, "add_offset");
     let scaled = scale.is_some() || offset.is_some();
+    // Values outside the valid range (in the stored units, as CF and HDF-EOS give it) are no-data.
+    let (vmin, vmax) = valid_range(ds);
     let (scale, offset) = (scale.unwrap_or(1.0), offset.unwrap_or(0.0));
     let all = SliceInfoElem::Slice { start: 0, end: u64::MAX, step: 1 };
     let mut bands = Vec::with_capacity(band_count as usize);
     let mut rounded = vec![0u64; band_count as usize];
     for b in 0..band_count {
-        let mut sel = Vec::with_capacity(n);
-        if n >= 3 {
-            sel.push(SliceInfoElem::Index(b));
-        }
-        if n == 4 {
-            sel.push(SliceInfoElem::Index(0));
-        }
-        sel.push(all.clone());
-        sel.push(all.clone());
+        let sel: Vec<SliceInfoElem> = (0..n)
+            .map(|k| match k {
+                _ if k == iy || k == ix => all.clone(),
+                _ if Some(k) == band_axis => SliceInfoElem::Index(b),
+                _ => SliceInfoElem::Index(0),
+            })
+            .collect();
         let raw = read_f64(ds, &SliceInfo { selections: sel }).map_err(|e| fail(&v.path, e))?;
         let data: Vec<f32> = raw
             .iter()
             .map(|&x| {
-                if fill.is_some_and(|fv| x == fv) || !x.is_finite() {
+                if fill.is_some_and(|fv| x == fv) || !x.is_finite() || vmin.is_some_and(|m| x < m) || vmax.is_some_and(|m| x > m) {
                     f32::NAN
                 } else {
                     let y = x * scale + offset;
@@ -261,28 +272,36 @@ fn read_variable(f: &Hdf5File, stem: &str, v: &Found, mut lost: Vec<String>) -> 
                 }
             })
             .collect();
-        bands.push(data);
+        bands.push(if transpose { transposed(&data, h as usize, w as usize) } else { data });
     }
     let data_type = if scaled { "Float32" } else { type_name(ds.dtype()) };
     let name = format!("{stem} {}", v.path.trim_start_matches('/'));
-    let place = cf_grid(&v.group, &dims, w, h).or_else(|| eos_grid(f, &v.path, w, h));
+    let place = match eos {
+        Some(g) => Some((g.transform, g.crs, g.flip_rows, g.flip_cols)),
+        None => cf_grid(&v.group, &dims, w, h).map(|(t, flip)| (t, Crs::LonLat, flip, false)),
+    };
     let mut r = match place {
-        Some((t, flip)) => {
-            if flip {
-                for band in &mut bands {
+        Some((t, crs, flip, flip_x)) => {
+            for band in &mut bands {
+                if flip {
                     flip_rows(band, w as usize, h as usize);
                 }
+                if flip_x {
+                    band.chunks_mut(w as usize).for_each(<[f32]>::reverse);
+                }
             }
-            Raster::new(name, w32, h32, bands, t, Crs::LonLat, None, ColorHint::Gray, data_type)?
+            Raster::new(name, w32, h32, bands, t, crs, None, ColorHint::Gray, data_type)?
         }
         None => {
-            lost.push("it gives no one-dimensional latitude/longitude it can be placed by, so it is shown unplaced".into());
+            if !lost.iter().any(|l| l.ends_with("shown unplaced")) {
+                lost.push("it gives no one-dimensional latitude/longitude it can be placed by, so it is shown unplaced".into());
+            }
             let mut r = Raster::new(name, w32, h32, bands, unreferenced(w32, h32), Crs::LonLat, None, ColorHint::Gray, data_type)?;
             r.georeferenced = false;
             r
         }
     };
-    if n == 3 {
+    if band_axis.is_some() {
         for (i, band) in r.bands.iter_mut().enumerate() {
             band.name = format!("{} {}", v.path.rsplit('/').next().unwrap_or("band"), i);
         }
@@ -358,32 +377,223 @@ fn packed_dms(v: f64) -> f64 {
     s * (d + m / 60.0 + sec / 3600.0)
 }
 
-/// An HDF-EOS5 geographic grid's transform, from `/HDFEOS INFORMATION/StructMetadata.0`, for a
-/// variable under `/HDFEOS/GRIDS/<grid>/`.
-fn eos_grid(f: &Hdf5File, path: &str, w: u64, h: u64) -> Option<(GeoTransform, bool)> {
-    let grid = path.strip_prefix("/HDFEOS/GRIDS/")?.split('/').next()?;
-    let meta = f.dataset("/HDFEOS INFORMATION/StructMetadata.0").ok()?.read_string().ok()?;
-    // The GROUP=GRID_n block whose GridName is this grid.
-    let block = meta.split("GROUP=GRID_").find(|b| b.contains(&format!("GridName=\"{grid}\"")))?;
-    let value = |key: &str| -> Option<&str> {
-        let i = block.find(&format!("{key}="))?;
-        let rest = &block[i + key.len() + 1..];
-        Some(rest.split(['\n', '\r']).next()?.trim())
-    };
-    let proj = value("Projection")?;
-    if !proj.contains("GCTP_GEO") {
-        return None;
+/// How an HDF-EOS5 grid's field lies on the ground: from its grid's block in
+/// `/HDFEOS INFORMATION/StructMetadata.0` (GCTP projection, corners, origin) and the field's
+/// `DimList`.
+struct EosGrid {
+    transform: GeoTransform,
+    crs: Crs,
+    /// The rows run south to north (`GridOrigin` lower, or corners given bottom first).
+    flip_rows: bool,
+    /// The columns run east to west (`GridOrigin` right).
+    flip_cols: bool,
+    /// Which of the field's dimensions are its YDim (rows) and XDim (columns).
+    iy: usize,
+    ix: usize,
+}
+
+/// The file's `StructMetadata.0` text. Read as a dataset, or, where the reader refuses its layout
+/// (some OMI level-3 files), found in the file's bytes, where HDF-EOS keeps it as plain text.
+fn struct_metadata(f: &Hdf5File, bytes: &[u8]) -> Option<String> {
+    if let Some(m) = f.dataset("/HDFEOS INFORMATION/StructMetadata.0").ok().and_then(|d| d.read_string().ok()) {
+        return Some(m);
     }
-    let pair = |key: &str| -> Option<(f64, f64)> {
-        let v = value(key)?.trim_matches(|c| c == '(' || c == ')');
-        let (a, b) = v.split_once(',')?;
-        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    const START: &[u8] = b"GROUP=SwathStructure";
+    let at = bytes.windows(START.len()).position(|w| w == START)?;
+    let end = bytes[at..].iter().position(|&b| b == 0).map_or(bytes.len(), |e| at + e);
+    String::from_utf8(bytes[at..end].to_vec()).ok()
+}
+
+/// A `KEY=value` line's value within an ODL block.
+fn odl<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+    block.lines().map(str::trim).find_map(|l| l.strip_prefix(key)?.strip_prefix('=')).map(str::trim)
+}
+
+/// The numbers of an ODL tuple, `(a,b,…)`.
+fn odl_numbers(v: &str) -> Vec<f64> {
+    v.trim_matches(|c| c == '(' || c == ')').split(',').filter_map(|x| x.trim().parse().ok()).collect()
+}
+
+/// The ellipsoid of a GCTP projection as PROJ parameters: `ProjParams[0]` the semi-major axis
+/// (a sphere's radius when `[1]` is 0), `[1]` the semi-minor axis (above 1) or the eccentricity
+/// squared (its magnitude, below 1; NSIDC writes it negative); else the `SphereCode`.
+fn gctp_ellipsoid(p: &[f64], sphere: Option<i64>) -> String {
+    let (a, b) = (p.first().copied().unwrap_or(0.0), p.get(1).copied().unwrap_or(0.0).abs());
+    if a > 0.0 {
+        return if b == 0.0 {
+            format!("+R={a}")
+        } else if b > 1.0 {
+            format!("+a={a} +b={b}")
+        } else {
+            format!("+a={a} +b={}", a * (1.0 - b).sqrt())
+        };
+    }
+    match sphere {
+        Some(0) | None => "+ellps=clrk66",
+        Some(1) => "+ellps=clrk80",
+        Some(2) => "+ellps=bessel",
+        Some(3) => "+ellps=intl",
+        Some(4) => "+ellps=intl",
+        Some(5) => "+ellps=WGS72",
+        Some(6) => "+ellps=evrst30",
+        Some(8) => "+ellps=GRS80",
+        Some(11) => "+ellps=airy",
+        Some(12) => "+ellps=WGS84",
+        Some(19) => "+R=6370997",
+        Some(20) => "+R=6371228",
+        Some(21) => "+R=6371007.181",
+        _ => "+ellps=WGS84",
+    }
+    .to_string()
+}
+
+/// The PROJ definition of a GCTP projection (`HE5_GCTP_PS`…) with its `ProjParams` (angles in
+/// packed DMS, distances in metres), or why it isn't drawn. `None` for geographic.
+fn gctp_proj4(proj: &str, p: &[f64], zone: Option<i64>, sphere: Option<i64>) -> std::result::Result<Option<String>, String> {
+    let name = proj.trim().trim_start_matches("HE5_").trim_start_matches("GCTP_");
+    let at = |i: usize| p.get(i).copied().unwrap_or(0.0);
+    let deg = |i: usize| packed_dms(at(i));
+    let ell = gctp_ellipsoid(p, sphere);
+    let fe = format!("+x_0={} +y_0={}", at(6), at(7));
+    let def = match name {
+        "GEO" => return Ok(None),
+        "UTM" => {
+            let z = zone.filter(|z| *z != 0 && z.abs() <= 60).ok_or("its UTM grid gives no zone")?;
+            let south = if z < 0 { " +south" } else { "" };
+            let ell = if at(0) > 0.0 { ell } else { gctp_ellipsoid(&[], sphere) };
+            format!("+proj=utm +zone={}{south} {ell}", z.abs())
+        }
+        // Polar stereographic: [4] the longitude down from the pole, [5] the latitude of true scale.
+        "PS" => {
+            let ts = deg(5);
+            let lat0 = if ts < 0.0 { -90.0 } else { 90.0 };
+            format!("+proj=stere +lat_0={lat0} +lat_ts={ts} +lon_0={} {fe} {ell}", deg(4))
+        }
+        "LAMAZ" => format!("+proj=laea +lat_0={} +lon_0={} {fe} {ell}", deg(5), deg(4)),
+        "SNSOID" => format!("+proj=sinu +lon_0={} {fe} {ell}", deg(4)),
+        "CEA" | "BCEA" => format!("+proj=cea +lon_0={} +lat_ts={} {fe} {ell}", deg(4), deg(5)),
+        "ALBERS" => format!("+proj=aea +lat_1={} +lat_2={} +lon_0={} +lat_0={} {fe} {ell}", deg(2), deg(3), deg(4), deg(5)),
+        "LAMCC" => format!("+proj=lcc +lat_1={} +lat_2={} +lon_0={} +lat_0={} {fe} {ell}", deg(2), deg(3), deg(4), deg(5)),
+        "MERCAT" => format!("+proj=merc +lon_0={} +lat_ts={} {fe} {ell}", deg(4), deg(5)),
+        "TM" => format!("+proj=tmerc +k={} +lon_0={} +lat_0={} {fe} {ell}", if at(2) > 0.0 { at(2) } else { 1.0 }, deg(4), deg(5)),
+        "POLYC" => format!("+proj=poly +lon_0={} +lat_0={} {fe} {ell}", deg(4), deg(5)),
+        "EQRECT" => format!("+proj=eqc +lat_ts={} +lon_0={} {fe} {ell}", deg(5), deg(4)),
+        other => return Err(format!("its grid's GCTP projection {other} isn't read, so it is shown unplaced")),
     };
-    let (ulx, uly) = pair("UpperLeftPointMtrs")?;
-    let (lrx, lry) = pair("LowerRightMtrs")?;
-    let (ulx, uly, lrx, lry) = (packed_dms(ulx), packed_dms(uly), packed_dms(lrx), packed_dms(lry));
-    let t = GeoTransform { origin_x: ulx, origin_y: uly, pixel_width: (lrx - ulx) / w as f64, pixel_height: (lry - uly) / h as f64 };
-    (t.is_valid() && t.pixel_height < 0.0).then_some((t, false))
+    Ok(Some(def + " +units=m +no_defs"))
+}
+
+/// An HDF-EOS5 grid field's placement, for a variable under `/HDFEOS/GRIDS/<grid>/` stored
+/// `d0 × d1` (its last two dimensions): `None` when it isn't one, an error saying why when its
+/// grid can't be placed.
+fn eos_grid(f: &Hdf5File, bytes: &[u8], path: &str, dims: &[u64]) -> Option<std::result::Result<EosGrid, String>> {
+    let rest = path.strip_prefix("/HDFEOS/GRIDS/")?;
+    let (grid, field_path) = rest.split_once('/')?;
+    let field = field_path.rsplit('/').next()?;
+    let meta = struct_metadata(f, bytes)?;
+    // The grid's own block (GROUP=GRID_n), up to the next grid's.
+    let block = meta.split("GROUP=GRID_").skip(1).find(|b| odl(b, "GridName").is_some_and(|n| n.trim_matches('"') == grid))?;
+    Some(eos_block(block, field, dims))
+}
+
+fn eos_block(block: &str, field: &str, dims: &[u64]) -> std::result::Result<EosGrid, String> {
+    let n = dims.len();
+    if n < 2 {
+        return Err("it has fewer than two dimensions".into());
+    }
+    let num = |k: &str| odl(block, k).and_then(|v| v.parse::<f64>().ok());
+    let (xdim, ydim) = (num("XDim").ok_or("its grid has no XDim")? as u64, num("YDim").ok_or("its grid has no YDim")? as u64);
+    // The field's dimension order: its DimList, else its shape against XDim/YDim.
+    let dim_list = block
+        .split("OBJECT=DataField_")
+        .find(|o| odl(o, "DataFieldName").is_some_and(|n| n.trim_matches('"') == field))
+        .and_then(|o| odl(o, "DimList"))
+        .map(|d| d.trim_matches(|c| c == '(' || c == ')').split(',').map(|s| s.trim().trim_matches('"').to_string()).collect::<Vec<_>>());
+    let at = |name: &str| dim_list.as_ref().filter(|d| d.len() == n).and_then(|d| d.iter().position(|x| x == name));
+    let (iy, ix) = match (at("YDim"), at("XDim")) {
+        (Some(y), Some(x)) => (y, x),
+        // No DimList: its last two, turned when they are (XDim, YDim).
+        _ if dims[n - 2] == xdim && dims[n - 1] == ydim && xdim != ydim => (n - 1, n - 2),
+        _ => (n - 2, n - 1),
+    };
+    if dims[iy] != ydim || dims[ix] != xdim {
+        let shape = dims.iter().map(u64::to_string).collect::<Vec<_>>().join(" × ");
+        return Err(format!("its shape ({shape}) doesn't hold its grid's YDim {ydim} × XDim {xdim}, so it is shown unplaced"));
+    }
+    let proj = odl(block, "Projection").ok_or("its grid names no projection")?;
+    let params = odl(block, "ProjParams").map(odl_numbers).unwrap_or_default();
+    let zone = num("ZoneCode").map(|z| z as i64);
+    let sphere = num("SphereCode").map(|z| z as i64);
+    let corner = |k: &str| -> std::result::Result<(f64, f64), String> {
+        match odl(block, k).map(odl_numbers).as_deref() {
+            Some([x, y]) => Ok((*x, *y)),
+            _ => Err(format!("its grid has no {k}")),
+        }
+    };
+    let (mut ulx, mut uly) = corner("UpperLeftPointMtrs")?;
+    let (mut lrx, mut lry) = corner("LowerRightMtrs")?;
+    let def = gctp_proj4(proj, &params, zone, sphere)?;
+    let crs = match &def {
+        None => {
+            (ulx, uly, lrx, lry) = (packed_dms(ulx), packed_dms(uly), packed_dms(lrx), packed_dms(lry));
+            Crs::LonLat
+        }
+        Some(d) => Crs::custom(super::crs::CustomCrs {
+            proj4: d.clone(),
+            label: format!("HDF-EOS5 {}", proj.trim_start_matches("HE5_")),
+            ..Default::default()
+        })
+        .map_err(|e| format!("its grid's projection ({d}) can't be used: {e}"))?,
+    };
+    // Where the first row and column are: the origin the grid names, else the corners' order
+    // (OMI and MOPITT give their south edge as "upper left").
+    let origin = odl(block, "GridOrigin").unwrap_or("");
+    let flip_rows = if origin.ends_with("GD_LL") || origin.ends_with("GD_LR") { true } else { uly < lry };
+    let flip_cols = origin.ends_with("GD_UR") || origin.ends_with("GD_LR");
+    let (west, east, north, south) = (ulx.min(lrx), ulx.max(lrx), uly.max(lry), uly.min(lry));
+    let t = GeoTransform {
+        origin_x: west,
+        origin_y: north,
+        pixel_width: (east - west) / xdim as f64,
+        pixel_height: -(north - south) / ydim as f64,
+    };
+    if !t.is_valid() || t.pixel_width <= 0.0 || t.pixel_height >= 0.0 {
+        return Err("its grid's corners don't make a grid, so it is shown unplaced".into());
+    }
+    Ok(EosGrid { transform: t, crs, flip_rows, flip_cols, iy, ix })
+}
+
+/// A band stored `(x, y)` (`cols` runs of `rows`) as rows of columns.
+fn transposed(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![f32::NAN; data.len()];
+    for x in 0..cols {
+        for y in 0..rows {
+            out[y * cols + x] = data[x * rows + y];
+        }
+    }
+    out
+}
+
+/// The valid range a variable gives (`valid_range`/`ValidRange`, `valid_min`, `valid_max`), in
+/// stored values.
+fn valid_range(ds: &Dataset) -> (Option<f64>, Option<f64>) {
+    for name in ["valid_range", "ValidRange"] {
+        if let Ok(a) = ds.attribute(name) {
+            let pair: Option<Vec<f64>> = a
+                .read_1d::<f64>()
+                .ok()
+                .or_else(|| a.read_1d::<f32>().ok().map(|v| v.into_iter().map(f64::from).collect()))
+                .or_else(|| a.read_1d::<i32>().ok().map(|v| v.into_iter().map(f64::from).collect()))
+                .or_else(|| a.read_1d::<i16>().ok().map(|v| v.into_iter().map(f64::from).collect()))
+                .or_else(|| a.read_1d::<u16>().ok().map(|v| v.into_iter().map(f64::from).collect()))
+                .or_else(|| a.read_1d::<u8>().ok().map(|v| v.into_iter().map(f64::from).collect()))
+                .or_else(|| a.read_1d::<i8>().ok().map(|v| v.into_iter().map(f64::from).collect()));
+            if let Some([lo, hi]) = pair.as_deref() {
+                return (Some(*lo), Some(*hi));
+            }
+        }
+    }
+    (attr_f64(ds, "valid_min"), attr_f64(ds, "valid_max"))
 }
 
 #[cfg(test)]
@@ -404,6 +614,49 @@ mod tests {
         let mut band = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         flip_rows(&mut band, 2, 3);
         assert_eq!(band, vec![5.0, 6.0, 3.0, 4.0, 1.0, 2.0]);
+    }
+
+    /// GCTP projections become PROJ definitions that land where NSIDC and EASE-Grid say they do.
+    #[test]
+    fn gctp_projections() {
+        let ps = gctp_proj4("HE5_GCTP_PS", &[6378273.0, -0.006694, 0.0, 0.0, -45000000.0, 70000000.0], None, Some(-1)).unwrap().unwrap();
+        assert!(ps.starts_with("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45"), "{ps}");
+        let crs = Crs::custom(crate::raster::crs::CustomCrs { proj4: ps, label: "PS".into(), ..Default::default() }).unwrap();
+        let t = crs.transformer().unwrap();
+        // NSIDC's north polar stereographic grid: its upper-left corner (NSIDC-0051 documentation).
+        let ul = t.to_lonlat(rustgis_geom::Coord { x: -3850000.0, y: 5850000.0 }).unwrap();
+        assert!((ul.y - 30.98).abs() < 0.01 && (ul.x - 168.35).abs() < 0.01, "{ul:?}");
+        // The pole is the projection's origin.
+        let pole = t.from_lonlat(rustgis_geom::Coord { x: 0.0, y: 90.0 }).unwrap();
+        assert!(pole.x.abs() < 1e-6 && pole.y.abs() < 1e-6, "{pole:?}");
+        // EASE-Grid north (LAMAZ on the 6371228 m sphere): 0°E at the equator lies 9,009,951 m
+        // below the pole (√2·R).
+        let laea = gctp_proj4("HE5_GCTP_LAMAZ", &[6371228.0, 0.0, 0.0, 0.0, 0.0, 90000000.0], None, Some(19)).unwrap().unwrap();
+        assert!(laea.contains("+R=6371228"), "{laea}");
+        let crs = Crs::custom(crate::raster::crs::CustomCrs { proj4: laea, label: "LAMAZ".into(), ..Default::default() }).unwrap();
+        let eq = crs.transformer().unwrap().from_lonlat(rustgis_geom::Coord { x: 0.0, y: 0.0 }).unwrap();
+        assert!(eq.x.abs() < 1.0 && (eq.y + 2f64.sqrt() * 6371228.0).abs() < 1.0, "{eq:?}");
+        assert!(gctp_proj4("HE5_GCTP_GEO", &[], None, None).unwrap().is_none());
+        assert!(gctp_proj4("HE5_GCTP_UTM", &[], Some(-33), Some(12)).unwrap().unwrap().contains("+zone=33 +south +ellps=WGS84"));
+        assert!(gctp_proj4("HE5_GCTP_ISINUS", &[], None, None).is_err());
+    }
+
+    /// An HDF-EOS5 grid block: MOPITT's (XDim, YDim) fields are turned, and a south-first grid
+    /// (corners given bottom first, or GD_LL) is flipped north up.
+    #[test]
+    fn eos_grid_blocks() {
+        let block = "GROUP=GRID_1\n\tGridName=\"MOP03\"\n\tXDim=360\n\tYDim=180\n\tUpperLeftPointMtrs=(-180000000.000000,-90000000.000000)\n\tLowerRightMtrs=(180000000.000000,90000000.000000)\n\tProjection=HE5_GCTP_GEO\n\t\tOBJECT=DataField_1\n\t\t\tDataFieldName=\"T\"\n\t\t\tDimList=(\"XDim\",\"YDim\")\n\t\tEND_OBJECT=DataField_1\n";
+        let g = eos_block(block, "T", &[360, 180]).unwrap();
+        assert!((g.iy, g.ix) == (1, 0) && g.flip_rows && !g.flip_cols);
+        assert_eq!((g.transform.origin_x, g.transform.origin_y, g.transform.pixel_width, g.transform.pixel_height), (-180.0, 90.0, 1.0, -1.0));
+        assert!(eos_block(block, "T", &[180, 360]).is_err(), "a shape that isn't the grid's");
+        // A level last, as MOPITT's profiles: (XDim, YDim, Prs).
+        let profile = block.replace("(\"XDim\",\"YDim\")", "(\"XDim\",\"YDim\",\"Prs\")");
+        assert_eq!(eos_block(&profile, "T", &[360, 180, 9]).map(|g| (g.iy, g.ix)), Ok((1, 0)));
+        let ul = block.replace("ProjParams", "x").replace("Projection=HE5_GCTP_GEO", "Projection=HE5_GCTP_GEO\n\tGridOrigin=HE5_HDFE_GD_UL").replace("(-180000000.000000,-90000000.000000)", "(-180000000.000000,90000000.000000)").replace("(180000000.000000,90000000.000000)", "(180000000.000000,-90000000.000000)").replace("(\"XDim\",\"YDim\")", "(\"YDim\",\"XDim\")");
+        let g = eos_block(&ul, "T", &[180, 360]).unwrap();
+        assert!((g.iy, g.ix) == (0, 1) && !g.flip_rows);
+        assert_eq!(transposed(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3), vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
     }
 
     /// Reads every `.h5`/`.nc`/`.he5` file in `$RUSTGIS_NCHDF_SAMPLES` (skipped when unset).
