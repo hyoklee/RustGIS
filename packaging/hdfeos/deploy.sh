@@ -3,15 +3,14 @@
 # under a sub-path of an Apache site: the local demo server, or hdfeos.org.
 #
 #   packaging/hdfeos/deploy.sh local                 # -> /usr/local/var/www/rustgis  (http://localhost:8080/rustgis/)
-#   HDFEOS_HOST=user@hdfeos.org HDFEOS_PATH=/var/www/html/rustgis \
-#     packaging/hdfeos/deploy.sh remote              # -> https://hdfeos.org/rustgis/
+#   packaging/hdfeos/deploy.sh remote                # -> https://hdfeos.org/rustgis/  (scp, as zoo/run does)
 #
 # Options (environment):
 #   SKIP_BUILD=1       reuse dist/hdfeos from the last build
 #   LOCAL_WWW=dir      local target (default /usr/local/var/www/rustgis)
 #   LOCAL_URL=url      URL checked after a local deploy (default http://localhost:8080/rustgis/)
-#   HDFEOS_HOST        ssh login for the remote server (required for `remote`)
-#   HDFEOS_PATH        directory on the server served at the sub-path (required for `remote`)
+#   HDFEOS_HOST        ssh login for hdfeos.org (default u40291205@home161441498.1and1-data.host)
+#   HDFEOS_PATH        directory served as https://hdfeos.org/rustgis/ (default hdfeos/rustgis, under ~)
 #   HDFEOS_URL         URL checked after a remote deploy (default https://hdfeos.org/rustgis/)
 #
 # The app is static (HTML, JS, WebAssembly); it needs no server code or special headers, only
@@ -68,10 +67,13 @@ case "$mode" in
     check "${LOCAL_URL:-http://localhost:8080/rustgis/}"
     ;;
   remote)
-    : "${HDFEOS_HOST:?set HDFEOS_HOST, e.g. user@hdfeos.org}"
-    : "${HDFEOS_PATH:?set HDFEOS_PATH, the directory served at the sub-path}"
-    ssh "$HDFEOS_HOST" "mkdir -p '$HDFEOS_PATH'"
-    rsync -az --delete "$out/" "$HDFEOS_HOST:$HDFEOS_PATH/"
+    host=${HDFEOS_HOST:-u40291205@home161441498.1and1-data.host}
+    path=${HDFEOS_PATH:-hdfeos/rustgis}
+    # Copied whole to a staging folder, then swapped in, so the site never serves half a build
+    # and old hashed files don't pile up.
+    ssh "$host" "rm -rf '$path.new' && mkdir -p '$path.new'"
+    scp -r -q "$out"/* "$out/.htaccess" "$host:$path.new/"
+    ssh "$host" "rm -rf '$path.old' && { [ ! -e '$path' ] || mv '$path' '$path.old'; } && mv '$path.new' '$path' && rm -rf '$path.old'"
     check "${HDFEOS_URL:-https://hdfeos.org/rustgis/}"
     ;;
 esac
