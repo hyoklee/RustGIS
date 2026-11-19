@@ -2206,6 +2206,12 @@ impl RustGisApp {
         if opts.is_none() && rustgis_engine::data::dxf::is_dxf_name(name) {
             return dialogs::open_dxf(self, name, dialogs::DxfSource::Bytes(bytes.to_vec()));
         }
+        // A NetCDF-4/HDF5 upload with several variables asks which to add.
+        if opts.is_none()
+            && let Some(v) = layerchooser::choose_variables(self, name, bytes)
+        {
+            return Ok(v);
+        }
         if rustgis_engine::data::raster::is_raster_name(name)
             || rustgis_engine::data::source::is_source_name(name)
             || rustgis_engine::data::io::is_multi_layer_name(name)

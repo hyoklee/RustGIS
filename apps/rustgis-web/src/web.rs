@@ -57,6 +57,12 @@ const DATA_EXTS: &[&str] = &[
     "tif",
     "tiff",
     "asc",
+    // NetCDF-4 and HDF5 (HDF-EOS5) rasters, read natively (#396).
+    "nc",
+    "nc4",
+    "h5",
+    "hdf5",
+    "he5",
 ];
 const CANVAS_ID: &str = "rustgis_canvas";
 const LOADING_ID: &str = "rustgis_loading";

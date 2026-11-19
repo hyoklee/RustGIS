@@ -18,6 +18,24 @@ pub struct Chooser {
     /// The project it was opened for (`Session::opened`): another project opened since drops it,
     /// so its layers never go to the wrong project.
     opened: u64,
+    /// An upload's contents (the browser, which has no path): a NetCDF-4/HDF5 file whose
+    /// variables are chosen, each added from these bytes by `layer.addDataBytes`.
+    bytes: Option<std::sync::Arc<Vec<u8>>>,
+}
+
+/// An uploaded NetCDF-4/HDF5 file holding several variables asks which to add (the first ticked):
+/// `None` when it holds one (or can't be listed), so it is added as before.
+pub fn choose_variables(app: &mut RustGisApp, name: &str, bytes: &[u8]) -> Option<Value> {
+    use rustgis_engine::data::raster::nchdf;
+    if !(app.ui.ask_layers && nchdf::is_name(name) && nchdf::is_hdf5(bytes)) {
+        return None;
+    }
+    let vars = nchdf::variables(bytes).ok().filter(|v| v.len() > 1)?;
+    let layers = vars.into_iter().enumerate().map(|(i, v)| (v, i == 0)).collect();
+    let opened = app.session.opened;
+    let bytes = Some(std::sync::Arc::new(bytes.to_vec()));
+    app.ui.choosing.push(Chooser { path: name.to_string(), listing: None, layers, filter: String::new(), opened, bytes });
+    Some(json!({"choosing": name}))
 }
 
 /// Whether a file lists its layers without reading their features, so it can ask which to add:
@@ -70,7 +88,7 @@ pub fn add_file(app: &mut RustGisApp, path: &str) -> Result<Value, String> {
         *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
     });
     let opened = app.session.opened;
-    app.ui.choosing.push(Chooser { path: path.to_string(), listing: Some(slot), layers: Vec::new(), filter: String::new(), opened });
+    app.ui.choosing.push(Chooser { path: path.to_string(), listing: Some(slot), layers: Vec::new(), filter: String::new(), opened, bytes: None });
     Ok(json!({"choosing": path}))
 }
 
@@ -84,7 +102,17 @@ fn add(app: &mut RustGisApp, p: Value) -> Result<Value, String> {
 
 /// Adds the layers ticked, each by name (a failure is told, by the command, and the rest still
 /// added).
-fn add_chosen(app: &mut RustGisApp, path: &str, layers: &[String]) {
+fn add_chosen(app: &mut RustGisApp, path: &str, layers: &[String], bytes: Option<&[u8]>) {
+    // An upload's variables, each read from its bytes.
+    if let Some(bytes) = bytes {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        for layer in layers {
+            let _ = app.run("layer.addDataBytes", json!({"fileName": path, "data": data, "layer": layer}));
+        }
+        app.map.invalidate();
+        return;
+    }
     // After any file read before them, in turn.
     for layer in layers {
         let _ = add(app, json!({"path": path, "layer": layer}));
@@ -192,8 +220,9 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     if let Some(layers) = add {
         let path = c.path.clone();
+        let bytes = c.bytes.clone();
         app.ui.choosing.remove(0);
-        add_chosen(app, &path, &layers);
+        add_chosen(app, &path, &layers, bytes.as_deref().map(Vec::as_slice));
     } else if cancel || !open {
         app.ui.choosing.remove(0);
     }
@@ -222,7 +251,7 @@ mod tests {
     fn listed(opened: u64, path: &str, result: Result<Value, String>) -> Chooser {
         let slot: crate::Slot<Result<Value, String>> = crate::Slot::default();
         *slot.lock().unwrap() = Some(result);
-        Chooser { path: path.to_string(), listing: Some(slot), layers: Vec::new(), filter: String::new(), opened }
+        Chooser { path: path.to_string(), listing: Some(slot), layers: Vec::new(), filter: String::new(), opened, bytes: None }
     }
 
     const KML: &str = r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document>
